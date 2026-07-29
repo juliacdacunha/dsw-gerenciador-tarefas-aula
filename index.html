@@ -1,13 +1,43 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aula 1</title>
+    <title>Gerenciador de tarefas</title>
 </head>
 <body>
-    <h1>ola mundo do Desenvolvimento web
-        
-    </h1>
+    <header>
+        <h1>Gereciador de Tarefas</h1>
+    </header>
+        <main>
+            <section>
+                <h2>Criar nova Tarefa</h2>
+                <form>
+                    <div>
+                        <label for="Input - Titulo">Titulo da atividade</label>
+                        <input type="text" id="Input - Titulo" required placeholder="Digite o nome da tarefa">
+                    </div>
+                    <div>
+                        <label for="select-prioridade">Prioridade:</label>
+                        <select id="select-prioridade">
+                            <option value="Low">Baixa</option>
+                            <option value="medium">Médio</option>
+                            <option value="high">Alta</option>
+                        </select>
+                    </div>
+                    <button type="submit">Cadastrar</button>    
+                </form>
+            </section>
+            <section>
+                <h2>Minhas tarefas</h2>
+                <div>
+                    <input type="checkbox">
+                    <h4>Estudar para a prova de Desenvolvimento WEB</h4>
+                </div>
+            </section>
+        </main>
+        <footer>
+            <p>Desenvolvimento de Sistemas WEB - 2026</p>
+        </footer>
 </body>
 </html>
