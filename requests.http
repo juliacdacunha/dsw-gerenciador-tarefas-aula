@@ -9,4 +9,17 @@ GET http://localhost:3000/api/health
 
 GET http://localhost:3000/api/version
 
+### Listar todas as tarefas (GET)
+
+GET https://localhost:3000/api/tasks
+
+### Criar nova tarefa (POST)
+
+POST https://localhost:3000/api/tasks
+Conten - Type: application/json
+
+{
+    "title: "Minha nova tarefa da noite"
+}
+
 
