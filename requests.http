@@ -1,25 +1,123 @@
 ### =====================
-### AULA 5: ROTAS DE DIAGNÓSTICO
+### ROTAS DE DIAGNÓSTICO
 ### =====================
 
-### Testas integridade do sistema (health Check)
+### Testar integridade do sistema (Health Check)
 GET http://localhost:3000/api/health
 
 ### Testar versão da aplicação 
-
 GET http://localhost:3000/api/version
 
 ### Listar todas as tarefas (GET)
-
-GET https://localhost:3000/api/tasks
+GET http://localhost:3000/api/tasks
 
 ### Criar nova tarefa (POST)
-
-POST https://localhost:3000/api/tasks
-Conten - Type: application/json
+POST http://localhost:3000/api/tasks
+Content-Type: application/json
 
 {
-    "title: "Minha nova tarefa da noite"
+  "titulo": "Minha nova tarefa da noite",
+  "prioridade": "high"
 }
 
+### Atualização Completa (PUT)
+PUT http://localhost:3000/api/tasks/1
+Content-Type: application/json
 
+{
+  "titulo": "Estudar arquitetura REST avançada",
+  "status": "completed",
+  "prioridade": "high"
+}
+
+### Atualização Parcial (PATCH)
+PATCH http://localhost:3000/api/tasks/1
+Content-Type: application/json
+
+{
+  "status": "completed"
+}
+
+### Deletar tarefa (DELETE)
+DELETE http://localhost:3000/api/tasks/1
+
+### =====================
+### PASSO 10: TESTES DE SEGURANÇA (AULA 05)
+### =====================
+
+### 33. Quebrando o Type Guard: Título numérico (deve retornar 400)
+POST http://localhost:3000/api/tasks
+Content-Type: application/json
+
+{
+  "titulo": 123,
+  "prioridade": "high"
+}
+
+### 34. Quebrando a Allowlist: Status não permitido (deve retornar 400)
+PATCH http://localhost:3000/api/tasks/1
+Content-Type: application/json
+
+{
+  "status": "cancelled"
+}
+
+### =====================
+### PASSO 5: TESTES DE SANITIZAÇÃO (AULA 04)
+### =====================
+
+### 31. Teste de Array Injection (A Busca Bizarra)
+GET http://localhost:3000/api/tasks?search=a&search=b
+
+### 32. Teste de Parâmetro Indefinido
+GET http://localhost:3000/api/tasks?search[]=a&search[]=b
+
+### =====================
+### TESTES DE AUTENTICAÇÃO (AULA 06)
+### =====================
+
+### 35. Registro com Sucesso (deve retornar 201)
+POST http://localhost:3000/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "aluno@senai.com",
+  "senha": "minhaSenhaSegura123"
+}
+
+### 36. Quebrando a Validação: Senha muito curta (deve retornar 400)
+POST http://localhost:3000/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "teste@senai.com",
+  "senha": "123"
+}
+
+### 37. Testando a Duplicidade: E-mail já cadastrado (deve retornar 409)
+POST http://localhost:3000/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "aluno@senai.com",
+  "senha": "outrasenha456"
+}
+
+### 38. Login com Sucesso (deve retornar o Token JWT)
+POST http://localhost:3000/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "aluno@senai.com",
+  "senha": "minhaSenhaSegura123"
+}
+
+### 39. Login com Senha Incorreta (deve retornar 401)
+POST http://localhost:3000/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "aluno@senai.com",
+  "senha": "senhaerrada"
+}
+```[cite: 2, 4]

@@ -1,0 +1,12 @@
+atividade 04
+dificuldade: : Lembrar de colocar o caractere %
+ dentro da busca do banco e não na query SQL
+
+atividade 05
+dificuldade :Montar a estrutura da transação 
+no PATCH para atualizar só os campos que o usuário enviou.
+ 
+
+ atividade 06
+ dificuldade:No início, quando tentei cadastrar o mesmo e-mail duas vezes para testar o erro 409, o banco aceitou sem reclamar e criou o usuário duplicado. Demorei um pouco para perceber que a tabela antiga ainda estava rodando sem a regra de `UNIQUE` no e-mail
+
