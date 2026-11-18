@@ -1,317 +1,523 @@
-import express from "express";
-import Database from "better-sqlite3";
+/**
+ * server.ts — API do Gerenciador de Tarefas
+ *
+ * Responsabilidades deste arquivo:
+ *   - conectar no banco (SQLite local ou Turso na nuvem, via libSQL)
+ *   - autenticar usuários (bcrypt para a senha, JWT para a sessão)
+ *   - expor o CRUD de tarefas, sempre isolado por usuário
+ *   - entregar o build do front-end (web/dist) na mesma porta da API
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import express, { type NextFunction, type Request, type Response } from "express";
+import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { createClient, type InValue } from "@libsql/client";
 
-const app = express();
+// ============================================================================
+// Configuração geral
+// ============================================================================
+
+const RAIZ = path.dirname(fileURLToPath(import.meta.url));
+
+// O .env é opcional: sem ele o projeto roda com SQLite local.
+const CAMINHO_ENV = path.join(RAIZ, ".env");
+if (fs.existsSync(CAMINHO_ENV)) {
+    const conteudo = fs.readFileSync(CAMINHO_ENV);
+    // Arquivo salvo "UTF-8 com BOM" faz a primeira variável não ser lida.
+    if (conteudo[0] === 0xef && conteudo[1] === 0xbb && conteudo[2] === 0xbf) {
+        console.warn("[aviso] O .env foi salvo com BOM. Salve como UTF-8 (sem BOM).");
+    }
+    process.loadEnvFile(CAMINHO_ENV);
+}
+
 const PORT = Number(process.env.PORT) || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "segredo_apenas_para_desenvolvimento";
 
-// Configuração da chave secreta do JWT
-const JWT_SECRET = process.env.JWT_SECRET || "super_secreto_desenvolvimento";
+const PASTA_FRONT = path.join(RAIZ, "web", "dist");
+const INDEX_FRONT = path.join(PASTA_FRONT, "index.html");
 
-// Middleware para ler o corpo das requisições em formato JSON
-app.use(express.json());
-
-// Inicialização do Banco de Dados SQLite
-const db = new Database("tarefa.db");
-
-// Criação das tabelas com a regra UNIQUE no e-mail
-db.exec(`
-  CREATE TABLE IF NOT EXISTS tarefas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    titulo TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    prioridade TEXT DEFAULT 'medium'
-  );
-
-  CREATE TABLE IF NOT EXISTS usuarios (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    senha TEXT NOT NULL
-  );
-`);
-
-console.log("Banco de dados SQLite inicializado com sucesso");
-
-// =====================================
-// TIPOS E HELPERS DE VALIDAÇÃO
-// =====================================
-
-export interface Tarefa {
-  id: number;
-  titulo: string;
-  status: string;
-  prioridade: string;
-}
-
-export interface Usuario {
-  id: number;
-  email: string;
-  senha: string;
-}
+// ============================================================================
+// Tipos e regras de negócio
+// ============================================================================
 
 const PRIORIDADES = ["low", "medium", "high"] as const;
 const STATUS_VALIDOS = ["pending", "completed"] as const;
 
-// Helper: Validação de ID
-function parsearId(idRaw: string): number | null {
-  const idNum = parseInt(idRaw, 10);
-  return isNaN(idNum) || idNum <= 0 ? null : idNum;
+type Prioridade = (typeof PRIORIDADES)[number];
+type Status = (typeof STATUS_VALIDOS)[number];
+
+interface Tarefa {
+    id: number;
+    usuario_id: number;
+    titulo: string;
+    descricao: string | null;
+    status: Status;
+    prioridade: Prioridade;
+    criado_em: string;
+    atualizado_em: string;
 }
 
-// Helper: Type Guard para validar título
-function tituloValido(titulo: unknown): titulo is string {
-  return typeof titulo === "string" && titulo.trim().length >= 3;
+interface Usuario {
+    id: number;
+    email: string;
+    senha_hash: string;
+    criado_em: string;
 }
 
-// Helper: Normalização de Prioridade (Allowlist)
-function normalizarPrioridade(prioridade: unknown): string {
-  if (typeof prioridade === "string" && PRIORIDADES.includes(prioridade as any)) {
-    return prioridade;
-  }
-  return "medium";
+/** Request depois de passar pelo middleware de autenticação. */
+interface RequisicaoAutenticada extends Request {
+    usuarioId?: number;
 }
 
-// Helper: Normalização de Status (Allowlist)
-function normalizarStatus(status: unknown): string {
-  if (typeof status === "string" && STATUS_VALIDOS.includes(status as any)) {
-    return status;
-  }
-  return "pending";
+/** Erro de validação: vira resposta 400 em vez de 500. */
+class ErroValidacao extends Error {}
+
+const ehTituloValido = (valor: unknown): valor is string =>
+    typeof valor === "string" && valor.trim().length >= 3;
+
+const ehPrioridade = (valor: unknown): valor is Prioridade =>
+    typeof valor === "string" && (PRIORIDADES as readonly string[]).includes(valor);
+
+const ehStatus = (valor: unknown): valor is Status =>
+    typeof valor === "string" && (STATUS_VALIDOS as readonly string[]).includes(valor);
+
+/** Valores fora da lista caem no padrão em vez de quebrar a requisição. */
+const prioridadeOuPadrao = (valor: unknown): Prioridade => (ehPrioridade(valor) ? valor : "medium");
+const statusOuPadrao = (valor: unknown): Status => (ehStatus(valor) ? valor : "pending");
+
+/** Converte o :id da URL. "12abc" ou "abc" viram null. */
+const lerId = (bruto: unknown): number | null => {
+    const id = Number(bruto);
+    return Number.isNaN(id) ? null : id;
+};
+
+// ============================================================================
+// Banco de dados (libSQL)
+// ============================================================================
+
+const TURSO_URL = process.env.TURSO_URL?.trim();
+const TURSO_TOKEN = process.env.TURSO_TOKEN?.trim();
+const NA_NUVEM = Boolean(TURSO_URL && TURSO_TOKEN);
+const DESCRICAO_BANCO = NA_NUVEM ? "Turso / libSQL (nuvem)" : "SQLite local (tarefas.db)";
+
+const db = createClient(
+    NA_NUVEM
+        ? { url: TURSO_URL!, authToken: TURSO_TOKEN }
+        : { url: "file:./tarefas.db" },
+);
+
+const CRIAR_USUARIOS = `
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        email       TEXT NOT NULL UNIQUE,
+        senha_hash  TEXT NOT NULL,
+        criado_em   DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`;
+
+const CRIAR_TAREFAS = `
+    CREATE TABLE IF NOT EXISTS tarefas (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario_id     INTEGER NOT NULL,
+        titulo         TEXT NOT NULL,
+        descricao      TEXT,
+        status         TEXT NOT NULL DEFAULT 'pending',
+        prioridade     TEXT NOT NULL DEFAULT 'medium',
+        criado_em      DATETIME DEFAULT CURRENT_TIMESTAMP,
+        atualizado_em  DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (usuario_id) REFERENCES usuarios (id) ON DELETE CASCADE
+    )`;
+
+async function colunasDe(tabela: string): Promise<string[]> {
+    const { rows } = await db.execute(`PRAGMA table_info(${tabela})`);
+    return rows.map((linha) => String(linha.name));
 }
 
-// =====================================
-// STATEMENTS PREPARADOS (SINGLETONS)
-// =====================================
-const stmtBuscarPorId = db.prepare("SELECT * FROM tarefas WHERE id = ?");
-const stmtInserirTarefa = db.prepare("INSERT INTO tarefas (titulo, prioridade) VALUES (?, ?)");
-const stmtDeletarTarefa = db.prepare("DELETE FROM tarefas WHERE id = ?");
-
-// Prepared Statements para Autenticação
-const stmtBuscarUsuarioPorId = db.prepare("SELECT * FROM usuarios WHERE id = ?");
-const stmtBuscarUsuarioPorEmail = db.prepare("SELECT * FROM usuarios WHERE email = ?");
-const stmtInserirUsuario = db.prepare("INSERT INTO usuarios (email, senha) VALUES (?, ?)");
-
-// =====================================
-// ROTAS DE DIAGNÓSTICO
-// =====================================
-
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", message: "servidor do gestor de tarefas ativo!" });
-});
-
-app.get("/api/version", (req, res) => {
-  res.json({
-    appName: "Gerenciador de Tarefas Multi-Usuario",
-    version: "1.0.0"
-  });
-});
-
-// Listar todas as tarefas do SQLite
-app.get("/api/tasks", (req, res) => {
-  const tarefas = db.prepare("SELECT * FROM tarefas").all();
-  res.json(tarefas);
-});
-
-// =====================================
-// ROTAS DE AUTENTICAÇÃO (AULA 06)
-// =====================================
-
-// Registro de Usuários
-app.post("/api/auth/register", (req, res) => {
-  const { email, senha } = req.body;
-
-  if (typeof email !== "string" || typeof senha !== "string") {
-    return res.status(400).json({ error: "E-mail e senha são obrigatórios." });
-  }
-
-  if (senha.trim().length < 6) {
-    return res.status(400).json({ error: "A senha deve ter ao menos 6 caracteres." });
-  }
-
-  const hash = bcrypt.hashSync(senha, 10);
-
-  try {
-    const resultado = stmtInserirUsuario.run(email.trim(), hash);
-    const usuario = stmtBuscarUsuarioPorId.get(resultado.lastInsertRowid) as Usuario;
-    return res.status(201).json({ id: usuario.id, email: usuario.email });
-  } catch {
-    return res.status(409).json({ error: "E-mail já cadastrado." });
-  }
-});
-
-// Login de Usuários
-app.post("/api/auth/login", (req, res) => {
-  const { email, senha } = req.body;
-
-  if (typeof email !== "string" || typeof senha !== "string") {
-    return res.status(400).json({ error: "E-mail e senha são obrigatórios." });
-  }
-
-  const usuario = stmtBuscarUsuarioPorEmail.get(email.trim()) as Usuario | undefined;
-
-  // Proteção contra Timing Attacks
-  const hashEsperado = usuario?.senha ?? "$2a$10$fakehashparanaquebrarcomparacao";
-  const senhaOk = bcrypt.compareSync(senha, hashEsperado);
-
-  if (!usuario || !senhaOk) {
-    return res.status(401).json({ error: "Credenciais inválidas." });
-  }
-
-  const token = jwt.sign({ id: usuario.id, email: usuario.email }, JWT_SECRET, {
-    expiresIn: "2h",
-  });
-
-  return res.json({ token });
-});
-
-// =====================================
-// ROTAS DE ESCRITA DE TAREFAS
-// =====================================
-
-// Criar Tarefa (POST)
-app.post("/api/tasks", (req, res) => {
-  const { titulo, prioridade } = req.body;
-  const prioridadeValida = normalizarPrioridade(prioridade);
-
-  if (!tituloValido(titulo)) {
-    return res.status(400).json({
-      error: "O título da tarefa é obrigatório e deve conter pelo menos 3 caracteres válidos."
-    });
-  }
-
-  try {
-    const resultado = stmtInserirTarefa.run(titulo.trim(), prioridadeValida);
-    const novaTarefa = stmtBuscarPorId.get(resultado.lastInsertRowid) as Tarefa;
-    return res.status(201).json(novaTarefa);
-  } catch {
-    return res.status(500).json({ error: "Erro ao processar persistência" });
-  }
-});
-
-// Excluir Tarefa (DELETE)
-app.delete("/api/tasks/:id", (req, res) => {
-  const idParaDeletar = parsearId(req.params.id);
-  if (idParaDeletar === null) {
-    return res.status(400).json({ error: "ID inválido." });
-  }
-
-  try {
-    const resultado = stmtDeletarTarefa.run(idParaDeletar);
-    if (resultado.changes === 0) {
-      return res.status(404).json({ error: "Tarefa não localizada para exclusão." });
+/**
+ * Bancos criados nas aulas anteriores (better-sqlite3) tinham a coluna
+ * `senha` e não tinham as colunas de data. Aqui eles são atualizados sem
+ * perder usuários nem tarefas.
+ */
+async function migrarBancoAntigo(): Promise<void> {
+    const colunasUsuarios = await colunasDe("usuarios");
+    if (colunasUsuarios.includes("senha") && !colunasUsuarios.includes("senha_hash")) {
+        await db.execute("ALTER TABLE usuarios RENAME COLUMN senha TO senha_hash");
     }
-    res.json({ message: "Tarefa excluída do banco SQLite com sucesso!" });
-  } catch {
-    res.status(500).json({ error: "Erro interno ao processar a exclusão." });
-  }
-});
-
-// Atualização Completa (PUT)
-app.put("/api/tasks/:id", (req, res) => {
-  const idParaAtualizar = parsearId(req.params.id);
-  if (idParaAtualizar === null) {
-    return res.status(400).json({ error: "ID inválido." });
-  }
-
-  const { titulo, prioridade, status } = req.body;
-
-  if (!tituloValido(titulo)) {
-    return res.status(400).json({
-      error: "O título da tarefa é obrigatório e deve conter pelo menos 3 caracteres válidos."
-    });
-  }
-
-  const prioridadeValida = normalizarPrioridade(prioridade);
-  const statusValido = normalizarStatus(status);
-
-  try {
-    const sql = "UPDATE tarefas SET titulo = ?, status = ?, prioridade = ? WHERE id = ?";
-    const resultado = db.prepare(sql).run(titulo.trim(), statusValido, prioridadeValida, idParaAtualizar);
-
-    if (resultado.changes === 0) {
-      return res.status(404).json({ message: "Tarefa não encontrada para atualização!" });
+    if (!colunasUsuarios.includes("criado_em")) {
+        await db.execute("ALTER TABLE usuarios ADD COLUMN criado_em DATETIME");
     }
 
-    const tarefaAtualizada = stmtBuscarPorId.get(idParaAtualizar) as Tarefa;
-    return res.status(200).json(tarefaAtualizada);
-  } catch {
-    return res.status(500).json({ error: "Erro ao processar a atualização no banco de dados." });
-  }
-});
+    // Senhas antigas gravadas em texto puro passam a ser hash bcrypt.
+    const { rows } = await db.execute("SELECT id, senha_hash FROM usuarios WHERE senha_hash NOT LIKE '$2%'");
+    for (const linha of rows) {
+        const hash = await bcrypt.hash(String(linha.senha_hash), 10);
+        await db.execute({ sql: "UPDATE usuarios SET senha_hash = ? WHERE id = ?", args: [hash, linha.id] });
+    }
 
-// Atualização Parcial (PATCH)
-app.patch("/api/tasks/:id", (req, res) => {
-  const idParaAtualizar = parsearId(req.params.id);
-  if (idParaAtualizar === null) {
-    return res.status(400).json({ error: "ID inválido." });
-  }
-
-  if (!req.body || Object.keys(req.body).length === 0) {
-    return res.status(400).json({ error: "Nenhum campo fornecido para atualização." });
-  }
-
-  const { titulo, prioridade, status } = req.body;
-
-  try {
-    const fluxoAtualizacao = db.transaction(() => {
-      const tarefaExistente = stmtBuscarPorId.get(idParaAtualizar) as Tarefa | undefined;
-      if (!tarefaExistente) return null;
-
-      const camposParaAtualizar: string[] = [];
-      const valoresParaAtualizar: unknown[] = [];
-
-      if (titulo !== undefined) {
-        if (!tituloValido(titulo)) {
-          throw new Error("O título da tarefa deve conter pelo menos 3 caracteres válidos.");
+    const colunasTarefas = await colunasDe("tarefas");
+    for (const coluna of ["descricao TEXT", "criado_em DATETIME", "atualizado_em DATETIME"]) {
+        const nome = coluna.split(" ")[0];
+        if (!colunasTarefas.includes(nome)) {
+            await db.execute(`ALTER TABLE tarefas ADD COLUMN ${coluna}`);
         }
-        camposParaAtualizar.push("titulo = ?");
-        valoresParaAtualizar.push(titulo.trim());
-      }
+    }
+    await db.execute("UPDATE tarefas SET atualizado_em = CURRENT_TIMESTAMP WHERE atualizado_em IS NULL");
+}
 
-      if (prioridade !== undefined) {
-        if (!PRIORIDADES.includes(prioridade as typeof PRIORIDADES[number])) {
-          throw new Error("Prioridade inválida. Use 'low', 'medium' ou 'high'.");
+async function prepararBanco(): Promise<void> {
+    await db.batch([CRIAR_USUARIOS, CRIAR_TAREFAS], "write");
+    await migrarBancoAntigo();
+
+    // Usuário de exemplo para testes rápidos.
+    const emailAdmin = "admin@senai.com";
+    const { rows } = await db.execute({ sql: "SELECT id FROM usuarios WHERE email = ?", args: [emailAdmin] });
+    if (rows.length === 0) {
+        const hash = await bcrypt.hash("senha_super_secreta_123", 10);
+        await db.execute({ sql: "INSERT INTO usuarios (email, senha_hash) VALUES (?, ?)", args: [emailAdmin, hash] });
+    }
+}
+
+/** Consultas usadas pelas rotas. Todas parametrizadas com `?`. */
+const repo = {
+    usuarioPorEmail: async (email: string) => {
+        const { rows } = await db.execute({ sql: "SELECT * FROM usuarios WHERE email = ?", args: [email] });
+        return rows[0] as unknown as Usuario | undefined;
+    },
+
+    criarUsuario: async (email: string, senhaHash: string) => {
+        const r = await db.execute({
+            sql: "INSERT INTO usuarios (email, senha_hash) VALUES (?, ?)",
+            args: [email, senhaHash],
+        });
+        return Number(r.lastInsertRowid);
+    },
+
+    listarTarefas: async (usuarioId: number, busca: string) => {
+        const { rows } = busca
+            ? await db.execute({
+                sql: `SELECT * FROM tarefas
+                      WHERE usuario_id = ? AND (titulo LIKE ? OR descricao LIKE ?)
+                      ORDER BY id DESC`,
+                args: [usuarioId, `%${busca}%`, `%${busca}%`],
+            })
+            : await db.execute({
+                sql: "SELECT * FROM tarefas WHERE usuario_id = ? ORDER BY id DESC",
+                args: [usuarioId],
+            });
+        return rows as unknown as Tarefa[];
+    },
+
+    tarefaDoUsuario: async (id: number, usuarioId: number) => {
+        const { rows } = await db.execute({
+            sql: "SELECT * FROM tarefas WHERE id = ? AND usuario_id = ?",
+            args: [id, usuarioId],
+        });
+        return rows[0] as unknown as Tarefa | undefined;
+    },
+
+    criarTarefa: async (usuarioId: number, titulo: string, prioridade: Prioridade) => {
+        const r = await db.execute({
+            sql: "INSERT INTO tarefas (usuario_id, titulo, status, prioridade) VALUES (?, ?, 'pending', ?)",
+            args: [usuarioId, titulo, prioridade],
+        });
+        return Number(r.lastInsertRowid);
+    },
+
+    excluirTarefa: async (id: number, usuarioId: number) => {
+        const r = await db.execute({
+            sql: "DELETE FROM tarefas WHERE id = ? AND usuario_id = ?",
+            args: [id, usuarioId],
+        });
+        return r.rowsAffected;
+    },
+};
+
+// ============================================================================
+// App Express e middlewares
+// ============================================================================
+
+const app = express();
+app.use(cors()); // o front em dev (porta 5173) chama a API na porta 3000
+app.use(express.json());
+
+/** Exige `Authorization: Bearer <token>` e descobre quem é o usuário. */
+const exigirLogin = (req: RequisicaoAutenticada, res: Response, next: NextFunction) => {
+    const cabecalho = req.headers.authorization;
+    if (!cabecalho?.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Token ausente ou mal formatado." });
+    }
+
+    try {
+        const conteudo = jwt.verify(cabecalho.slice(7), JWT_SECRET) as { id: number };
+        req.usuarioId = conteudo.id;
+        return next();
+    } catch {
+        return res.status(401).json({ error: "Token inválido ou expirado." });
+    }
+};
+
+// ============================================================================
+// Rotas públicas
+// ============================================================================
+
+app.get("/api/health", async (_req, res) => {
+    try {
+        await db.execute("SELECT 1");
+        return res.json({ status: "ok", message: "Servidor do Gerenciador de Tarefas ativo!", banco: DESCRICAO_BANCO });
+    } catch {
+        return res.status(503).json({ status: "erro", message: "O banco de dados não respondeu.", banco: DESCRICAO_BANCO });
+    }
+});
+
+app.get("/api/version", (_req, res) => {
+    res.json({ appName: "Gerenciador de Tarefas Multi-Usuário", version: "1.1.0", banco: DESCRICAO_BANCO });
+});
+
+/** Lê a senha aceitando os dois nomes de campo usados nos testes. */
+const senhaDoCorpo = (corpo: Record<string, unknown> | undefined): unknown =>
+    corpo?.senha ?? corpo?.password;
+
+app.post("/api/auth/register", async (req, res) => {
+    const email = req.body?.email;
+    const senha = senhaDoCorpo(req.body);
+
+    if (typeof email !== "string" || !email.trim().includes("@")) {
+        return res.status(400).json({ error: "Informe um e-mail válido." });
+    }
+    if (typeof senha !== "string" || senha.trim().length < 6) {
+        return res.status(400).json({ error: "A senha deve ter pelo menos 6 caracteres." });
+    }
+
+    try {
+        const hash = await bcrypt.hash(senha, 10);
+        const id = await repo.criarUsuario(email.trim(), hash);
+        return res.status(201).json({ id, email: email.trim() });
+    } catch (erro) {
+        const texto = String((erro as { message?: string })?.message ?? "");
+        if (texto.includes("UNIQUE")) {
+            return res.status(409).json({ error: "E-mail já cadastrado." });
         }
-        camposParaAtualizar.push("prioridade = ?");
-        valoresParaAtualizar.push(prioridade);
-      }
+        console.error("Falha no cadastro:", erro);
+        return res.status(500).json({ error: "Não foi possível concluir o cadastro agora." });
+    }
+});
 
-      if (status !== undefined) {
-        if (!STATUS_VALIDOS.includes(status as typeof STATUS_VALIDOS[number])) {
-          throw new Error("Status inválido. Use 'pending' ou 'completed'.");
+app.post("/api/auth/login", async (req, res) => {
+    const email = req.body?.email;
+    const senha = senhaDoCorpo(req.body);
+
+    if (typeof email !== "string" || typeof senha !== "string" || !email.trim() || !senha) {
+        return res.status(400).json({ error: "E-mail e senha são obrigatórios." });
+    }
+
+    try {
+        const usuario = await repo.usuarioPorEmail(email.trim());
+        // Compara mesmo quando o usuário não existe, para o tempo de resposta
+        // não denunciar quais e-mails estão cadastrados.
+        const hash = usuario?.senha_hash ?? "$2a$10$hashinvalidoparaigualarotempodecomparacao";
+        const senhaConfere = await bcrypt.compare(senha, hash);
+
+        if (!usuario || !senhaConfere) {
+            return res.status(401).json({ error: "Credenciais inválidas." });
         }
-        camposParaAtualizar.push("status = ?");
-        valoresParaAtualizar.push(status);
-      }
 
-      if (camposParaAtualizar.length === 0) return tarefaExistente;
+        const token = jwt.sign({ id: usuario.id, email: usuario.email }, JWT_SECRET, { expiresIn: "8h" });
+        return res.json({ token });
+    } catch (erro) {
+        console.error("Falha no login:", erro);
+        return res.status(500).json({ error: "Não foi possível entrar agora." });
+    }
+});
 
-      const sql = `UPDATE tarefas SET ${camposParaAtualizar.join(", ")} WHERE id = ?`;
-      valoresParaAtualizar.push(idParaAtualizar);
-      db.prepare(sql).run(...valoresParaAtualizar);
+// ============================================================================
+// Rotas de tarefas (todas protegidas e filtradas pelo usuário do token)
+// ============================================================================
 
-      return stmtBuscarPorId.get(idParaAtualizar) as Tarefa;
+app.get("/api/tasks", exigirLogin, async (req: RequisicaoAutenticada, res) => {
+    // Se vier ?search=a&search=b (array), ignoramos e listamos tudo.
+    const busca = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    try {
+        return res.json(await repo.listarTarefas(req.usuarioId!, busca));
+    } catch {
+        return res.status(500).json({ error: "Erro interno ao listar as tarefas." });
+    }
+});
+
+app.post("/api/tasks", exigirLogin, async (req: RequisicaoAutenticada, res) => {
+    const { titulo, prioridade } = req.body ?? {};
+    if (!ehTituloValido(titulo)) {
+        return res.status(400).json({ error: "O título da tarefa é obrigatório e deve ter pelo menos 3 caracteres." });
+    }
+
+    try {
+        const id = await repo.criarTarefa(req.usuarioId!, titulo.trim(), prioridadeOuPadrao(prioridade));
+        return res.status(201).json(await repo.tarefaDoUsuario(id, req.usuarioId!));
+    } catch {
+        return res.status(500).json({ error: "Erro ao salvar a tarefa." });
+    }
+});
+
+app.put("/api/tasks/:id", exigirLogin, async (req: RequisicaoAutenticada, res) => {
+    const id = lerId(req.params.id);
+    if (id === null) return res.status(400).json({ error: "ID inválido." });
+
+    const { titulo, prioridade, status } = req.body ?? {};
+    if (!ehTituloValido(titulo)) {
+        return res.status(400).json({ error: "O título da tarefa é obrigatório e deve ter pelo menos 3 caracteres." });
+    }
+
+    try {
+        const r = await db.execute({
+            sql: `UPDATE tarefas
+                  SET titulo = ?, status = ?, prioridade = ?, atualizado_em = CURRENT_TIMESTAMP
+                  WHERE id = ? AND usuario_id = ?`,
+            args: [titulo.trim(), statusOuPadrao(status), prioridadeOuPadrao(prioridade), id, req.usuarioId!],
+        });
+        if (r.rowsAffected === 0) {
+            return res.status(404).json({ error: "Tarefa não encontrada para atualização." });
+        }
+        return res.json(await repo.tarefaDoUsuario(id, req.usuarioId!));
+    } catch {
+        return res.status(500).json({ error: "Erro ao atualizar a tarefa." });
+    }
+});
+
+app.patch("/api/tasks/:id", exigirLogin, async (req: RequisicaoAutenticada, res) => {
+    const id = lerId(req.params.id);
+    if (id === null) return res.status(400).json({ error: "ID inválido." });
+
+    if (!req.body || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: "Nenhum campo enviado para atualização." });
+    }
+
+    const { titulo, prioridade, status } = req.body;
+
+    try {
+        const atual = await repo.tarefaDoUsuario(id, req.usuarioId!);
+        if (!atual) return res.status(404).json({ error: "Tarefa não encontrada." });
+
+        // Monta o UPDATE só com os campos que vieram, sempre com `?`.
+        const sets: string[] = [];
+        const valores: InValue[] = [];
+
+        if (titulo !== undefined) {
+            if (!ehTituloValido(titulo)) throw new ErroValidacao("O título deve ter pelo menos 3 caracteres.");
+            sets.push("titulo = ?");
+            valores.push(titulo.trim());
+        }
+        if (prioridade !== undefined) {
+            if (!ehPrioridade(prioridade)) throw new ErroValidacao("Prioridade inválida. Use 'low', 'medium' ou 'high'.");
+            sets.push("prioridade = ?");
+            valores.push(prioridade);
+        }
+        if (status !== undefined) {
+            if (!ehStatus(status)) throw new ErroValidacao("Status inválido. Use 'pending' ou 'completed'.");
+            sets.push("status = ?");
+            valores.push(status);
+        }
+
+        if (sets.length === 0) return res.json(atual);
+
+        await db.execute({
+            sql: `UPDATE tarefas SET ${sets.join(", ")}, atualizado_em = CURRENT_TIMESTAMP
+                  WHERE id = ? AND usuario_id = ?`,
+            args: [...valores, id, req.usuarioId!],
+        });
+        return res.json(await repo.tarefaDoUsuario(id, req.usuarioId!));
+    } catch (erro) {
+        if (erro instanceof ErroValidacao) return res.status(400).json({ error: erro.message });
+        return res.status(500).json({ error: "Erro ao atualizar parcialmente a tarefa." });
+    }
+});
+
+app.delete("/api/tasks/:id", exigirLogin, async (req: RequisicaoAutenticada, res) => {
+    const id = lerId(req.params.id);
+    if (id === null) return res.status(400).json({ error: "ID inválido." });
+
+    try {
+        const removidas = await repo.excluirTarefa(id, req.usuarioId!);
+        if (removidas === 0) {
+            return res.status(404).json({ error: "Tarefa não encontrada para exclusão." });
+        }
+        return res.json({ message: "Tarefa excluída com sucesso!" });
+    } catch {
+        return res.status(500).json({ error: "Erro ao excluir a tarefa." });
+    }
+});
+
+// ============================================================================
+// Front-end (build do React servido pela própria API)
+// ============================================================================
+
+// Qualquer /api desconhecido responde JSON, e não o index.html do front.
+app.use("/api", (_req, res) => {
+    res.status(404).json({ error: "Rota de API não encontrada." });
+});
+
+app.use(express.static(PASTA_FRONT));
+
+app.get(/(.*)/, (_req, res) => {
+    if (!fs.existsSync(INDEX_FRONT)) {
+        return res
+            .status(503)
+            .type("text/plain")
+            .send(
+                "O build do front-end ainda não foi gerado.\n\n" +
+                "Rode na raiz do projeto:\n" +
+                "  npm run build:web\n\n" +
+                "A API continua disponível em /api/health.",
+            );
+    }
+    return res.sendFile(INDEX_FRONT);
+});
+
+/** Data de modificação mais recente dentro de uma pasta (recursivo). */
+function ultimaAlteracao(pasta: string): number {
+    let maior = 0;
+    for (const item of fs.readdirSync(pasta, { withFileTypes: true })) {
+        const caminho = path.join(pasta, item.name);
+        maior = Math.max(maior, item.isDirectory() ? ultimaAlteracao(caminho) : fs.statSync(caminho).mtimeMs);
+    }
+    return maior;
+}
+
+function avisarSobreFront(): void {
+    if (!fs.existsSync(INDEX_FRONT)) {
+        console.warn("[aviso] web/dist não existe. Gere o front com: npm run build:web");
+        return;
+    }
+    const fontes = path.join(RAIZ, "web", "src");
+    if (fs.existsSync(fontes) && ultimaAlteracao(fontes) > ultimaAlteracao(PASTA_FRONT)) {
+        console.warn("[aviso] O código do front mudou depois do último build. Rode: npm run build:web");
+    }
+}
+
+// ============================================================================
+// Inicialização
+// ============================================================================
+
+async function iniciar(): Promise<void> {
+    try {
+        await prepararBanco();
+    } catch (erro) {
+        console.error("[erro] Não foi possível preparar o banco:", erro);
+        if (NA_NUVEM) console.error("Confira TURSO_URL e TURSO_TOKEN no .env.");
+        process.exitCode = 1;
+        return;
+    }
+
+    app.listen(PORT, () => {
+        console.log("------------------------------------------------------------");
+        console.log(` Banco : ${DESCRICAO_BANCO}`);
+        if (!NA_NUVEM) console.log(" (para usar o Turso, preencha TURSO_URL e TURSO_TOKEN no .env)");
+        console.log(` API   : http://localhost:${PORT}/api/health`);
+        console.log(` Front : http://localhost:${PORT}`);
+        console.log("------------------------------------------------------------");
+        avisarSobreFront();
     });
+}
 
-    const resultado = fluxoAtualizacao();
-    if (!resultado) {
-      return res.status(404).json({ message: "Tarefa não encontrada para atualização parcial!" });
-    }
-
-    return res.status(200).json(resultado);
-  } catch (erro) {
-    if (
-      erro instanceof Error &&
-      (erro.message.includes("inválid") || erro.message.includes("caracteres"))
-    ) {
-      return res.status(400).json({ error: erro.message });
-    }
-    return res.status(500).json({ error: "Erro ao processar a atualização parcial no banco." });
-  }
-});
-
-// Inicialização do servidor
-app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
+void iniciar();

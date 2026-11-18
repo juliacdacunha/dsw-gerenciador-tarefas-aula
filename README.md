@@ -23,9 +23,10 @@ O projeto consiste em um sistema completo de **gerenciamento de tarefas multiusu
 ## 🛠️ Tecnologias Utilizadas
 
 - **Linguagem & Runtime:** [Node.js](https://nodejs.org/) / [TypeScript](https://www.typescriptlang.org/)
-- **Estilização Frontend:** [Tailwind CSS](https://tailwindcss.com/)
+- **Backend:** Express + libSQL (SQLite/Turso), autenticação com bcrypt e JWT
+- **Frontend:** React + Vite + [Tailwind CSS](https://tailwindcss.com/)
 - **Banco de Dados:** [SQLite](https://www.sqlite.org/)
-- **Testes HTTP:** REST Client (`requests.http`)
+- **Testes HTTP:** REST Client (`request.http`)
 
 ---
 
@@ -45,9 +46,11 @@ O projeto consiste em um sistema completo de **gerenciamento de tarefas multiusu
 
 ```text
 .
-├── index.html            # Interface de usuário (Frontend)
+├── index.html            # Página estática das primeiras aulas
 ├── server.ts             # Ponto de entrada do servidor backend (API)
-├── tailwind.config.js    # Configurações de estilos do Tailwind CSS
+├── .env.example          # Modelo das variáveis de ambiente
 ├── tsconfig.json         # Configurações do compilador TypeScript
 ├── package.json          # Dependências e scripts do projeto
-└── requests.http         # Arquivo para testes e validação das rotas da API
+├── request.http          # Arquivo para testes e validação das rotas da API
+└── web/                  # Frontend em React (Vite + Tailwind)
+```
